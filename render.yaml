@@ -12,6 +12,10 @@ services:
     envVars:
       - key: DATABASE_PATH
         value: /var/data/malika.db
+      - key: UPLOAD_DIR
+        value: /var/data/uploads
+      - key: PERSIST_DIR
+        value: /var/data
       - key: SECRET_KEY
         generateValue: true
       - key: ADMIN_USER

@@ -1,17 +1,27 @@
 import os, sqlite3, secrets
 from functools import wraps
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify, abort
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_from_directory, send_file, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from jinja2 import ChoiceLoader, FileSystemLoader
+import shutil
 
 APP_DIR=os.path.dirname(os.path.abspath(__file__))
 DB_PATH=os.environ.get("DATABASE_PATH", os.path.join(APP_DIR,"malika.db"))
-UPLOAD_DIR=os.path.join(APP_DIR,"static","uploads")
+UPLOAD_DIR=os.environ.get("UPLOAD_DIR", os.path.join(APP_DIR,"static","uploads"))
+PERSIST_DIR=os.environ.get("PERSIST_DIR", "/var/data" if os.path.isdir("/var/data") else APP_DIR)
+CODE_DIR=os.path.join(PERSIST_DIR,"site_code")
+BACKUP_DIR=os.path.join(PERSIST_DIR,"code_backups")
 os.makedirs(UPLOAD_DIR,exist_ok=True)
+os.makedirs(os.path.join(CODE_DIR,"templates"),exist_ok=True)
+os.makedirs(os.path.join(CODE_DIR,"static"),exist_ok=True)
+os.makedirs(BACKUP_DIR,exist_ok=True)
 app=Flask(__name__)
-app.secret_key=os.environ.get("SECRET_KEY","change-this-secret-key-"+secrets.token_hex(16))
+app.secret_key=os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 app.config["MAX_CONTENT_LENGTH"]=8*1024*1024
+# Admin can customize only public HTML templates and CSS; Python source is never editable.
+app.jinja_loader = ChoiceLoader([FileSystemLoader(os.path.join(CODE_DIR,"templates")), app.jinja_loader])
 ALLOWED={"png","jpg","jpeg","webp","gif"}
 
 def db():
@@ -56,7 +66,12 @@ def save_image(file):
     if ext not in ALLOWED: raise ValueError("Faqat PNG, JPG, WEBP yoki GIF rasm yuklang.")
     name=secrets.token_hex(12)+"."+ext
     file.save(os.path.join(UPLOAD_DIR,name))
-    return "uploads/"+name
+    return name
+@app.route("/uploads/<path:filename>")
+def uploaded_file(filename):
+    # Render persistent disk is used for uploads; never store user uploads in the deploy bundle.
+    return send_from_directory(UPLOAD_DIR, filename)
+
 @app.route("/")
 def home():
     with db() as c:
@@ -164,6 +179,82 @@ def change_password():
             flash("Eski parol noto‘g‘ri yoki yangi parol 8 belgidan kam."); return redirect(url_for("dashboard")+"#security")
         c.execute("UPDATE users SET password_hash=? WHERE id=?",(generate_password_hash(new),session["admin"]))
     flash("Parol yangilandi."); return redirect(url_for("dashboard")+"#security")
+
+# ---- Admin website code editor (HTML/CSS only; Python files are intentionally blocked) ----
+EDITABLE_FILES = {
+    "index.html": os.path.join(APP_DIR, "templates", "index.html"),
+    "style.css": os.path.join(APP_DIR, "static", "style.css"),
+}
+
+def code_file_path(name):
+    if name not in EDITABLE_FILES:
+        abort(404)
+    sub = "templates" if name.endswith(".html") else "static"
+    return os.path.join(CODE_DIR, sub, name)
+
+def read_site_code(name):
+    override = code_file_path(name)
+    source = EDITABLE_FILES[name]
+    path = override if os.path.isfile(override) else source
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.route("/site-style.css")
+def site_style():
+    path = code_file_path("style.css")
+    if os.path.isfile(path):
+        return send_file(path, mimetype="text/css")
+    return send_file(EDITABLE_FILES["style.css"], mimetype="text/css")
+
+@app.route("/admin/code", methods=["GET", "POST"])
+@admin_required
+def edit_site_code():
+    name = request.args.get("file", "index.html")
+    if name not in EDITABLE_FILES:
+        name = "index.html"
+    message = ""
+    if request.method == "POST":
+        name = request.form.get("file", "index.html")
+        if name not in EDITABLE_FILES:
+            abort(400)
+        content = request.form.get("content", "")
+        if len(content) > 500_000:
+            flash("Kod hajmi 500 KB dan oshmasin.")
+            return redirect(url_for("edit_site_code", file=name))
+        # Validate Jinja syntax before replacing the live template.
+        if name.endswith(".html"):
+            try:
+                app.jinja_env.from_string(content)
+            except Exception as exc:
+                flash("HTML/Jinja sintaksis xatosi: " + str(exc)[:220])
+                return render_template("code_editor.html", files=list(EDITABLE_FILES), selected=name, content=content)
+        target = code_file_path(name)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.exists(target):
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shutil.copy2(target, os.path.join(BACKUP_DIR, f"{name.replace('.', '_')}_{stamp}.bak"))
+        else:
+            shutil.copy2(EDITABLE_FILES[name], os.path.join(BACKUP_DIR, f"{name.replace('.', '_')}_original.bak"))
+        temp = target + ".tmp"
+        with open(temp, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(temp, target)
+        flash("Kod saqlandi. O‘zgarish saytga qo‘llandi.")
+        return redirect(url_for("edit_site_code", file=name))
+    return render_template("code_editor.html", files=list(EDITABLE_FILES), selected=name, content=read_site_code(name))
+
+@app.route("/admin/code/reset", methods=["POST"])
+@admin_required
+def reset_site_code():
+    name = request.form.get("file", "")
+    target = code_file_path(name)
+    if os.path.isfile(target):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(target, os.path.join(BACKUP_DIR, f"{name.replace('.', '_')}_{stamp}_before_reset.bak"))
+        os.remove(target)
+        flash("Asl standart kod tiklandi.")
+    return redirect(url_for("edit_site_code", file=name))
+
 @app.errorhandler(413)
 def too_large(e): return "Rasm hajmi 8 MB dan oshmasin.",413
-if __name__=="__main__": app.run(debug=True,port=int(os.environ.get("PORT",5000)),host="0.0.0.0")
+if __name__=="__main__": app.run(debug=os.environ.get("FLASK_DEBUG") == "1",port=int(os.environ.get("PORT",5000)),host="0.0.0.0")
